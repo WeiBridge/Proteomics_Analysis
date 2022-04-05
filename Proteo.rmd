@@ -1,0 +1,546 @@
+=---
+title: "Covid vs Icu: DE comparisons with DESeq2 vs EdgeR vs Limma-voom vs tweeDEseq"
+author: "Wei"
+date: "13/01/2022"
+output:
+  word_document: default
+  html_document: default
+---
+
+This analysis is base on the Standard workflow in:
+
+1\. Analyzing RNA-seq data with DESeq2 <https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#model-matrix-not-full-rank> Michael I. Love, Simon Anders, and Wolfgang Huber 05/19/2021
+
+2\. Statistical models of Differential Expression <https://github.com/mistrm82/msu_ngs2015/blob/master/hands-on.Rmd> jessicalumian 08/15/2015 3.edgeR: differential analysis of sequence read count data <https://www.bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf> Yunshun Chen, Davis McCarthy, Matthew Ritchie,Mark Robinson, and Gordon Smyth
+
+4.limma:Linear Models for Microarray and RNA-Seq Data User's Guide <https://bioconductor.org/packages/release/bioc/vignettes/limma/inst/doc/usersguide.pdf> Gordon K. Smyth, Matthew Ritchie, Natalie Thorne,James Wettenhall, Wei Shi and Yifang Hu, Bioinformatics Division, The Walter and Eliza Hall Institute of Medical Research, Melbourne, Australia
+
+5.Practical statistical analysis of RNA-Seq data - edgeR - tomato data<http://www.nathalievialaneix.eu/doc/html/solution_edgeR-tomato.html>,Annick Moisan, Ignacio Gonzales, Nathalie Villa-Vialaneix
+
+6.tweeDEseq: analysis of RNA-seq data using the Poisson-Tweedie family of distributions, Mikel Esnaola, Robert Castelo, Juan Ramon Gonzalez
+
+
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r GlobalOptions}
+options(knitr.duplicate.label = 'allow')
+```
+
+## The workflow:
+
+1.  Load the packages(DESeq2, edgeR, limma, tweeDEseq)
+
+2.  Create a metadata data frame
+
+    2.1 Read new raw counts and perpare rawCounts dataframe
+
+    2.2 Read new raw info and perpare rawInfo dataframe
+
+    2.2.1 Use regular expresstion to extract correct SampleCode from FIleName
+
+    2.2.2 Deal with other incorrect samplecode
+
+    2.3 The Three datasets and one design matrix
+
+    2.4 Create objects
+
+    2.5 The mean-variance relationship
+
+3.  Build the models with DESeq2, EdgeR, limma-voom, and tweeDEseq
+
+4.  Differential Expression comparisons with DESeq2, EdgeR, limma-voom, and tweeDEseq.
+
+
+## 1. Load the packages
+
+```{r include=FALSE}
+ # if (!requireNamespace("BiocManager", quietly = TRUE))
+ #     install.packages("BiocManager")
+ # BiocManager::install("DESeq2")
+# BiocManager::install("ashr")
+# BiocManager::install("apeglm")
+# BiocManager::install("IHW")
+# BiocManager::install("limma")
+# BiocManager::install("edgeR")
+# #BiocManager::install("Homo.sapiens")
+#install.packages("dplyr") 
+# BiocManager::install("tweeDEseq")
+library(dplyr)
+library(tidyverse)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(tweeDEseq)
+
+```
+
+## 2. Create a metadata data frame: Compare normal people, Icu, Covid
+
+### 2.1 Read new raw counts and perpare rawCounts dataframe
+
+```{r}
+#Read new raw counts data
+rawCounts <- read.delim("Table1_SEQUESTCounts.csv",sep="\t", header = T, fileEncoding="UTF-8-BOM", row.names = "GeneSymbol")
+
+rawCounts <- rawCounts[,-1]
+
+#set nulls as 0
+rawCounts[rawCounts == "NULL"] <- 0
+
+colnames(rawCounts) <- substring(colnames(rawCounts),2,5)
+
+
+# #mask the gene names
+# rownames(rawCounts) <-sprintf("gene %d", 1:length(rownames(rawCounts)))
+
+# Convert counts into numerical type
+rawCounts <- mutate_all(rawCounts, function(x) as.numeric(as.character(x)))
+
+
+#Read new raw Info data
+rawInfo <- read.delim("Table_VariableMappingTable.txt", sep="\t", header = T, fileEncoding="UTF-8-BOM")
+
+## use regular expresstion to extract correct SampleCode from FIleName
+## (correcting of A, B, C, D, E, F, G, H.)
+#Extract normal people dataframe as normalInfo 
+normalInfo <- filter(rawInfo, ProgramID == 2) 
+
+# retrieve new SampleCode from 'FIleName'
+tempInfo <- 
+  normalInfo %>%
+  tidyr::extract(FIleName, 
+          into = 'RT_SampleCode', '[ae]([0-9A-Z]+)_',
+          remove = FALSE)
+
+# use retrieved SampleCode update normalInfo
+normalInfo[, 'SampleCode'] <- tempInfo[, "RT_SampleCode"]
+
+
+# use retrieved SampleCode update rawInfo
+rawInfo[rawInfo$ProgramID== 2, 'SampleCode'] <- tempInfo[, "RT_SampleCode"]
+
+           
+#summary(factor(normalInfo$SampleCode), maxsum = 500)
+
+#Extract normal people dataframe as normalInfo 
+normalInfo <- filter(rawInfo, ProgramID == 2) 
+
+# retrieve new SampleCode from 'FIleName'
+tempInfo <- 
+  normalInfo %>%
+  tidyr::extract(FIleName, 
+          into = 'RT_SampleCode', '[ae]([0-9A-Z]+)_',
+          remove = FALSE)
+
+# use retrieved SampleCode update normalInfo
+normalInfo[, 'SampleCode'] <- tempInfo[, "RT_SampleCode"]
+
+
+# use retrieved SampleCode update rawInfo
+rawInfo[rawInfo$ProgramID== 2, 'SampleCode'] <- tempInfo[, "RT_SampleCode"]
+
+           
+# Update both normalInfo and rawInfo's SampleCode == 12 into 4.
+
+normalInfo[normalInfo$SampleCode == 12, "SampleCode"] <- 4
+
+rawInfo[rawInfo$SampleCode == 12, "SampleCode"] <- 4
+
+
+```
+
+
+### 2.3 The datasets and one design matrix
+
+### (1) Expression matrix (x)
+
+### remove "mzMLID" variables, sum up three replicates counts based on same SampleCode
+
+```{r}
+library(data.table)
+# transpose the rowCounts
+rawCounts_t <- transpose(rawCounts)
+# get row and colnames in order
+colnames(rawCounts_t) <- rownames(rawCounts)
+rownames(rawCounts_t) <- colnames(rawCounts)
+
+
+# add "mzMLID" into x and convert these columns into factor.
+rawCounts_t <- rownames_to_column(rawCounts_t, "mzMLID")
+rawInfo$mzMLID <- factor(rawInfo$mzMLID)
+rawCounts_t$mzMLID <- factor(rawCounts_t$mzMLID)
+
+# left join normalInfo with rawCounts_t into one dataframe by "mzMLID"
+df <- left_join(rawInfo, rawCounts_t, by = "mzMLID")
+# remove unnecessary columns
+df <- df[, c(-1,-2,-3,-4,-6,-7)]
+dim(df)
+# group by Samplecode and sum up counts
+df <- df %>%
+  group_by(SampleCode) %>%
+  summarise(across(everything(), sum)) 
+
+df <- arrange(df, df$SampleCode)
+# rename the row by SampleCode
+df <- column_to_rownames(df, var = "SampleCode") 
+
+# transpose back
+df_t <- transpose(df)
+# get row and colnames in order
+colnames(df_t) <- rownames(df)
+rownames(df_t) <- colnames(df)
+
+#Tranform into a numeric matrix. Note that the values of df_t is already numeric
+x <- as.matrix(df_t)
+dim(x)
+
+```
+
+
+### (2) Phenotype data (p)
+
+```{r}
+p <- rawInfo[,c(-1,-3,-4,-7)]
+
+p <- p[!duplicated(p$SampleCode),]
+rownames(p) <- p$SampleCode
+p <- p[,-2]
+
+# remove ProgramID=2 Normal 
+p <- filter(p, p$ProgramID == 1  | p$ProgramID == 3) 
+
+p$ProgramID <- factor(p$ProgramID)
+p$TimePointOrdinal <- factor(p$TimePointOrdinal)
+
+levels(p$ProgramID) <- c("C", "I")
+levels(p$TimePointOrdinal) <- c("T1", "T2", "T3")
+p$Pairs <- factor(paste(p$ProgramID,p$TimePointOrdinal ,sep="."))
+
+head(p)
+```
+
+### (3) Design matrix (design)
+
+```{r}
+#group <- factor(paste(p$ProgramID,p$TimePointOrdinal ,sep="."))
+levels(p$ProgramID)
+design.mat <- model.matrix(~ p$ProgramID, data = p)
+colnames(design.mat) <- levels(p$ProgramID)
+
+#for limma-voom
+design <- model.matrix(~ 0 + p$ProgramID, data = p)
+colnames(design) <- levels(p$ProgramID)
+```
+
+### 2.4 Create Objects
+
+```{r}
+#verify the x column names match the p rownames
+idx <- match(rownames(p), colnames(x))
+x <- x[,idx]
+all(colnames(x) == rownames(p))
+```
+
+### (1) ExpressionSet object for all models
+```{r}
+#mask the gene names
+x_mask <- x
+head(x_mask)
+rownames(x_mask) <- sprintf("gene %d", 1:length(rownames(x)))
+
+eset <- ExpressionSet(assayData = x_mask,
+                      phenoData = AnnotatedDataFrame(p),
+                      design = design.mat)
+
+```
+
+```{r}
+exprs(eset)
+pData(eset)
+```
+
+```{r}
+hist(exprs(eset),  breaks=10, main= 'Density Plot' , probability=TRUE, col="gray", border="white")
+    d <- density(exprs(eset)[,c(1:20)])
+    lines(d, col="red")
+
+    
+d <- density(exprs(eset)[,c(1:20)])
+plot(d, type="n", main="Robbery Plot")
+polygon(d, col="lightgray", border="gray")
+rug(exprs(eset)[,c(2:5)], col="red")
+
+
+boxplot(exprs(eset)[,c(1:20)], horizontal=TRUE, main="Distribution")
+
+```
+
+
+
+
+### (2) Modle compare with top 100 "Sum_LIT_Plasma_X2" gene list
+
+```{r}
+#Gene_Symbol Sum_LIT_Plasma_X2
+my_data <- read.delim("Gene_Symbol Sum_LIT_Plasma_X2_vs_Noise n FINAL.txt",sep="\t", header = T)
+my_data <- my_data[order(my_data$Sum_LIT_Plasma_X2_vs_Noise,decreasing = T),]
+
+#These top 100 proteins are the highly suspicious proteins. We are going to use them for model comparison.
+
+Top1000.XTANDEM <- my_data[1:1000,]$Gene_Symbol
+length(Top1000.XTANDEM)
+
+id <- na.omit(match(Top1000.XTANDEM,rownames(x)))
+matched_row <- exprs(eset)[id,]
+matched_row <- DGEList(matched_row)
+matched_row <- calcNormFactors(matched_row)
+dim(matched_row)
+matched_row
+```
+```{r}
+# #mask the gene names
+# rownames(rawCounts) <-sprintf("gene %d", 1:length(rownames(rawCounts)))
+countsCod <- normalizeCounts(exprs(eset), pData(eset)[,"ProgramID"])
+#countsCod <- filterCounts(countsCod)
+matched_row <- countsCod[id,]
+chi2gof <- gofTest(matched_row, a=0) 
+```
+
+
+
+```{r}
+chi2gof <- gofTest(matched_row, a=0) 
+
+chi2gof <- as.list(chi2gof)
+#uniq_gene <- lapply(chi2gof, function(x) x[!is.na(x)])
+uniq_gene <- chi2gof[!is.na(chi2gof)]
+
+
+cplot_list <- list()
+iplot_list <- list()
+i<-1
+
+
+for (c in names(uniq_gene)){
+
+
+  file <- paste0("file_", i, ".png")
+  png(file, height = 600, width = 1200)
+  par(mfrow=c(1,2)) 
+  xf <- unlist(exprs(eset)[c, ProgramIDCovid == 'C'])
+  xm <- unlist(exprs(eset)[c, ProgramIDCovid == 'I'])
+  try({
+  cplot_list[[i]] <- compareCountDist(xf, main=paste(c,"Covid", sep ="_"))
+  iplot_list[[i]] <- compareCountDist(xm, main=paste(c,"Icu", sep ="_"))}, TRUE)
+  i <- i+1
+  dev.off()
+}
+
+```
+We can observe that the Poisson distribution is not adequate and that the negative binomial distribution is not adequate for some samples.
+This illustrates a case in which Poisson and negative binomial distributions may be too restrictive to account for the biological variability that extensively-replicated RNA-seq experiments can reveal in count data.
+
+This is another example that the fitness of TweeDeseq  > Negative Binomial > Poisson.
+
+
+# Bulid all models
+#TweeDEseq
+
+```{r}
+
+countsCod <- normalizeCounts(exprs(eset), pData(eset)[,"ProgramID"])
+countsCod <- filterCounts(countsCod)
+dim(countsCod)
+resPT <- tweeDE(countsCod, pData(eset)[,"ProgramID"])
+resPT
+```
+
+```{r}
+dge_tweed <- resPT[sort(resPT$pval.adjust, index.return = TRUE)$ix,]
+sig <- subset(dge_tweed, pval.adjust<0.05)
+dge_tweed_up <- rownames(subset(sig, log2fc>0))
+dge_tweed_dn <- rownames(subset(sig, log2fc<0))
+length(dge_tweed_up)
+length(dge_tweed_dn)
+
+```
+
+
+#DESeq2
+```{r}
+dds <- DESeqDataSetFromMatrix(exprs(eset), DataFrame(pData(eset)), design.mat)
+dds <- DESeq(dds,quiet=TRUE)
+dge_deseq2 <- results(dds)
+dge_deseq2 <- dge_deseq2[sort(dge_deseq2$padj, index.return = TRUE)$ix,]
+dge_deseq2
+
+sig <- subset(dge_deseq2, padj<0.05)
+dge_deseq2_up <- rownames(subset(sig, log2FoldChange>0))
+dge_deseq2_dn <- rownames(subset(sig, log2FoldChange<0))
+length(dge_deseq2_up)
+length(dge_deseq2_dn)
+```
+
+
+#EdgeR
+```{r}
+y <- DGEList(counts=x_mask, group = p$ProgramID)
+keep <- filterByExpr(y)
+y <- y[keep,,keep.lib.sizes=FALSE]
+
+edger <- calcNormFactors(y)
+
+edger <- estimateDisp(edger, design.mat, robust=TRUE, prior.df=1)
+
+
+edger.fit <- glmFit(edger, design.mat)
+edger.lrt <- glmLRT(edger.fit)
+```
+
+
+
+```{r}
+dge_edger <- as.data.frame(topTags(edger.lrt,n=Inf))
+dge_edger$dispersion<-edger.lrt$dispersion
+dge_edger<-merge(dge_edger,edger.lrt$fitted.values,by='row.names')
+rownames(dge_edger)=dge_edger$Row.names
+dge_edger$Row.names=NULL
+dge_edger<-dge_edger[order(dge_edger$PValue),]
+dge_edger
+sig <- subset(dge_edger,FDR<0.05)
+dge_edger_up <- rownames(subset(sig,logFC>0))
+dge_edger_dn <- rownames(subset(sig,logFC<0))
+length(dge_edger_up)
+length(dge_edger_dn)
+
+```
+
+
+
+## Limma-voom
+
+```{r,voom}
+
+lim <- DGEList(counts=exprs(eset))
+keep <- filterByExpr(lim, design)
+lim <- lim[keep,,keep.lib.sizes=FALSE]
+lim <- calcNormFactors(lim)
+
+v <- voom(lim, design, plot=FALSE)
+vfit <- lmFit(v, design)
+#should tell the contrast
+contr <- makeContrasts(I - C, levels = colnames(coef(vfit)))
+cfit <- contrasts.fit(vfit,contrasts=contr)
+efit <- eBayes(cfit)
+```
+```{r}
+dge_voom <- topTable(efit,n=Inf)
+sig <- subset(dge_voom,adj.P.Val<0.05)
+dge_voom_up <- rownames(subset(sig,logFC>0))
+dge_voom_dn <- rownames(subset(sig,logFC<0))
+length(dge_voom_up)
+length(dge_voom_dn)
+```
+
+
+# Venn diagram
+
+With the "eulerr" project.
+
+```{r,venn}
+library("eulerr")
+v1 <- list("edgeR_lrt up"=dge_edger_up, "edgeR_lrt dn"=dge_edger_dn,
+  "tweed up"=dge_tweed_up, "tweed dn"=dge_tweed_dn,
+  "DESeq2 up"=dge_deseq2_up,"DESeq2 dn"=dge_deseq2_dn,
+  "limma_voom up"=dge_voom_up, "limma_voom dn"=dge_voom_dn)
+plot(euler(v1),quantities = TRUE)
+
+
+```
+
+
+# Upset plot
+
+This should demonstrate the overlaps between different sets better.
+
+```{r,upset}
+library("UpSetR")
+v1 <- list("edgeR up"=dge_edger_up, 
+  "tweed up"=dge_tweed_up, 
+  "DESeq2 up"=dge_deseq2_up,
+  "limma_voom up"=dge_voom_up)
+
+upset(fromList(v1), order.by = "freq")
+
+v2 <- list("edgeR down"=dge_edger_dn, 
+  "tweed down"=dge_tweed_dn, 
+  "DESeq2 down"=dge_deseq2_dn,
+  "limma_voom down"=dge_voom_dn)
+
+upset(fromList(v2), order.by = "freq")
+
+```
+
+# Barplots
+
+Some genes that are significant with *tweed* but not *edgeR*.
+
+```{r,barplots,fig.height=8,fig.width=8}
+
+xx <- x_mask/colSums(x_mask)*1e6
+par(mfrow=c(3,3))
+mysample <- sample(setdiff( dge_tweed_dn , dge_edger_dn),9)
+lapply(mysample,function(x) { 
+  vec <- xx[which(rownames(xx) %in% x ),]
+  barplot(t(vec)[,1])
+  mtext(x) 
+})
+
+
+par(mfrow=c(3,3))
+mysample <- sample(setdiff( dge_tweed_up , dge_edger_up),9)
+lapply(mysample,function(x) { 
+  vec <- xx[which(rownames(xxx) %in% x ),]
+  barplot(t(vec)[,1])
+  mtext(x) 
+})
+
+```
+
+
+
+## Session information
+
+```{r,session}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
